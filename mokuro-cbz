@@ -1,0 +1,217 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mokuro==0.2.5"]
+# ///
+"""Runs mokuro OCR on the manga pages in one or more given directories and
+packs each result into a CBZ laid out like the mokuro reader's export.
+
+Usage:
+  ./mokuro-cbz <directory> [<directory> ...] [-o OUTPUT_DIR] [--force-cpu] [--no-cache] [--model NAME]
+
+Dependencies are handled by uv via the inline script metadata above; the first
+run creates a cached environment with mokuro in it.
+
+mokuro is driven in-process through its internal API (VolumeCollection and
+MokuroGenerator.process_volume) instead of its CLI, so the OCR models are
+loaded only once for all directories and a failed volume raises instead of
+only being logged. That API isn't stable, which is why mokuro is pinned.
+
+Nothing is written into the source folders. For "<series>/<volume>", all
+output goes to "OUTPUT_DIR/<series>/" (OUTPUT_DIR defaults to ./mokuro-out):
+  _ocr/<volume>/            mokuro's per-page OCR cache
+  <volume>.mokuro           mokuro's OCR data
+  <series> - <volume>.cbz   the result
+Keep the cache and .mokuro files: re-runs reuse the cached OCR results and
+the volume and series uuids from them. Legacy HTML output is disabled.
+
+The CBZ contains, matching the reader's "extract" export:
+  <volume>/            the page images
+  <volume>.mokuro      the OCR data, with the "chars" count the reader adds
+  series.json          series index listing every OCR'd volume of the series
+                       found in OUTPUT_DIR/<series>/
+"""
+
+import argparse
+import json
+import re
+import sys
+import zipfile
+from pathlib import Path
+
+import mokuro.volume
+from mokuro import MokuroGenerator
+from mokuro.volume import VolumeCollection
+
+SERIES_FILE_NAME = "series.json"
+# The reader uses the epoch as updated_at for series files without user-set facts.
+FACTLESS_UPDATED_AT = "1970-01-01T00:00:00.000Z"
+
+
+def natural_key(s):
+    # Approximates the reader's Intl.Collator({numeric: true, sensitivity: "base"}).
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", s)]
+
+
+def series_key(title):
+    return " ".join(title.split()).casefold()
+
+
+def char_count(mokuro_data):
+    return sum(len(line) for page in mokuro_data["pages"] for block in page["blocks"] for line in block["lines"])
+
+
+def redirect_mokuro_output(output_dir):
+    """Makes mokuro put "<series>/<volume>"'s output into "output_dir/<series>/".
+
+    mokuro derives every output path (the .mokuro file, the _ocr cache, the
+    title directory whose name becomes the series title and whose .mokuro
+    files decide the series uuid) from get_path_mokuro(), which normally
+    returns the sibling "<series>/<volume>.mokuro".
+    """
+
+    def get_path_mokuro(path_in):
+        return output_dir / path_in.parent.name / f"{path_in.name}.mokuro"
+
+    mokuro.volume.get_path_mokuro = get_path_mokuro
+
+
+def build_series_file(series_title, series_dir):
+    """Lists every OCR'd volume of the series found in series_dir."""
+    volumes = {}
+    for path in series_dir.glob("*.mokuro"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"Skipping unreadable mokuro file {path}: {e}", file=sys.stderr)
+            continue
+        if series_key(data.get("title", "")) != series_key(series_title):
+            continue
+        volumes[data["volume_uuid"]] = {
+            "volume_uuid": data["volume_uuid"],
+            "volume_title": data["volume"],
+            "page_count": len(data["pages"]),
+            "character_count": data.get("chars", char_count(data)),
+            "mokuro_version": data["version"],
+        }
+
+    return {
+        "version": 2,
+        "series_title": series_title,
+        "external_ids": {},
+        "titles": {},
+        "synonyms": [],
+        "updated_at": FACTLESS_UPDATED_AT,
+        "volumes": sorted(volumes.values(), key=lambda v: natural_key(v["volume_title"])),
+    }
+
+
+def write_cbz(target_dir, mokuro_path):
+    mokuro_data = json.loads(mokuro_path.read_text(encoding="utf-8"))
+
+    series_title = mokuro_data["title"]
+    volume_title = mokuro_data["volume"]
+    exported_mokuro = {
+        "version": mokuro_data["version"],
+        "title": series_title,
+        "title_uuid": mokuro_data["title_uuid"],
+        "volume": volume_title,
+        "volume_uuid": mokuro_data["volume_uuid"],
+        "pages": mokuro_data["pages"],
+        "chars": mokuro_data.get("chars", char_count(mokuro_data)),
+    }
+    series_file = build_series_file(series_title, mokuro_path.parent)
+
+    # Like the reader: pages go flat into "<volume>/" unless that would make
+    # file names collide, in which case their subdirectories are kept.
+    img_paths = [page["img_path"] for page in mokuro_data["pages"]]
+    flatten = len({Path(p).name for p in img_paths}) == len(img_paths)
+
+    cbz_path = mokuro_path.parent / f"{series_title} - {volume_title}.cbz"
+    tmp_path = cbz_path.with_name(cbz_path.name + ".part")
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        written_dirs = set()
+
+        def add_dir(name):
+            if name not in written_dirs:
+                zf.mkdir(name)
+                written_dirs.add(name)
+
+        add_dir(f"{volume_title}/")
+        for img_path in img_paths:
+            if flatten:
+                arcname = f"{volume_title}/{Path(img_path).name}"
+            else:
+                arcname = f"{volume_title}/{img_path}"
+                parts = img_path.split("/")[:-1]
+                for i in range(len(parts)):
+                    add_dir(f"{volume_title}/{'/'.join(parts[: i + 1])}/")
+            zf.write(target_dir / img_path, arcname)
+        zf.writestr(f"{volume_title}.mokuro", json.dumps(exported_mokuro, ensure_ascii=False, separators=(",", ":")))
+        zf.writestr(SERIES_FILE_NAME, json.dumps(series_file, ensure_ascii=False, separators=(",", ":")))
+    tmp_path.replace(cbz_path)
+    print(f"Wrote CBZ: {cbz_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run mokuro OCR on manga directories and pack each into a reader-style CBZ."
+    )
+    parser.add_argument("directories", nargs="+", type=Path, metavar="directory")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=Path("mokuro-out"),
+        help="where to write the OCR cache, .mokuro and CBZ files, in one subdirectory per series (default: %(default)s)",
+    )
+    parser.add_argument("--force-cpu", action="store_true", help="run OCR on the CPU even if CUDA is available")
+    parser.add_argument("--no-cache", action="store_true", help="ignore cached OCR results in the _ocr directories")
+    parser.add_argument(
+        "--model", default="kha-white/manga-ocr-base", help="manga-ocr model name or path (default: %(default)s)"
+    )
+    args = parser.parse_args()
+
+    target_dirs = []
+    for d in args.directories:
+        if not d.is_dir():
+            parser.error(f"Not a directory: {d}")
+        target_dirs.append(d.resolve())
+    target_dirs = list(dict.fromkeys(target_dirs))
+    output_dir = args.output_dir.resolve()
+    for target_dir in target_dirs:
+        if output_dir == target_dir or output_dir.is_relative_to(target_dir):
+            parser.error(f"Output directory {output_dir} must not be inside {target_dir}")
+
+    redirect_mokuro_output(output_dir)
+    for target_dir in target_dirs:
+        (output_dir / target_dir.parent.name).mkdir(parents=True, exist_ok=True)
+
+    # Mirrors what mokuro's run() does before processing, minus legacy HTML.
+    vc = VolumeCollection()
+    for target_dir in target_dirs:
+        vc.add_path_in(target_dir)
+    for title in vc.titles.values():
+        title.set_uuid()
+    generator = MokuroGenerator(pretrained_model_name_or_path=args.model, force_cpu=args.force_cpu)
+
+    failed = []
+    for target_dir in target_dirs:
+        volume = vc.volumes[mokuro.volume.get_path_mokuro(target_dir)]
+        print(f"Running mokuro on: {target_dir}")
+        try:
+            generator.process_volume(volume, no_cache=args.no_cache)
+            write_cbz(target_dir, volume.path_mokuro)
+        except Exception as e:
+            print(f"Failed: {target_dir}: {e!r}", file=sys.stderr)
+            failed.append(target_dir)
+
+    if failed:
+        print(f"\n{len(failed)} of {len(target_dirs)} failed, no CBZ written for:", file=sys.stderr)
+        for target_dir in failed:
+            print(f"  {target_dir}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

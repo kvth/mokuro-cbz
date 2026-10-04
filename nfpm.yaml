@@ -1,0 +1,25 @@
+name: mokuro-cbz
+# A single Python script run through uv, so the package is architecture
+# independent
+arch: all
+platform: linux
+version: ${VERSION}
+section: graphics
+priority: optional
+maintainer: Kevin Thomas <thomas.kevth@gmail.com>
+description: |
+  Run mokuro OCR on manga folders and pack each volume into a CBZ.
+  The CBZs are laid out like the mokuro reader's own export, so they can
+  be imported into the reader directly.
+license: MIT
+# Needs uv at runtime (the script runs through 'uv run --script'), which is
+# not packaged by the distributions, so it is not declared as a dependency
+contents:
+  - src: ./mokuro-cbz
+    dst: /usr/bin/mokuro-cbz
+    file_info:
+      mode: 0755
+  - src: ./completions/mokuro-cbz.bash
+    dst: /usr/share/bash-completion/completions/mokuro-cbz
+    file_info:
+      mode: 0644

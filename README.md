@@ -44,6 +44,10 @@ Process every volume of a series:
 ./mokuro-cbz comics/*
 ```
 
+Bash completion comes with the packages; from a checkout, `source
+completions/mokuro-cbz.bash`, or copy it to
+`~/.local/share/bash-completion/completions/mokuro-cbz`.
+
 ### Options
 
 | Option | Description |
@@ -52,6 +56,7 @@ Process every volume of a series:
 | `--force-cpu` | Run OCR on the CPU even if CUDA is available |
 | `--no-cache` | Ignore cached OCR results and OCR every page again |
 | `--model NAME` | manga-ocr model name or path (default: `kha-white/manga-ocr-base`) |
+| `--version` | Print the version and exit |
 
 ## Output
 
@@ -111,3 +116,22 @@ volumes at the end and exits with status 1.
   errors per volume are reported. That code isn't a stable API, so check the
   script still works before changing the pin.
 - mokuro's legacy HTML output is not generated.
+
+## Packaging
+
+```
+make install-deps         # nfpm v2.47.0 via go install (NFPM_VERSION=vX.Y.Z)
+make packages             # deb and rpm
+make deb                  # -> build/mokuro-cbz_<version>_all.deb
+make rpm                  # -> build/mokuro-cbz-<version>-1.noarch.rpm
+```
+
+- the version is `__version__` in `mokuro-cbz` (override with `VERSION=x.y.z`);
+  to release: bump it, commit, `git tag v<version>`
+- packages install `mokuro-cbz` to `/usr/bin/mokuro-cbz` and are
+  architecture independent
+- uv is needed at runtime but is not a package dependency, since
+  distributions don't package it; install it yourself
+- bash completion: `completions/mokuro-cbz.bash`, installed to
+  `/usr/share/bash-completion/completions/mokuro-cbz`; lists the options by
+  hand, so keep it in sync with the script

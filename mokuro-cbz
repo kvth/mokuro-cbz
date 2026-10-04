@@ -43,6 +43,8 @@ import mokuro.volume
 from mokuro import MokuroGenerator
 from mokuro.volume import VolumeCollection
 
+__version__ = "0.1.0"
+
 SERIES_FILE_NAME = "series.json"
 # The reader uses the epoch as updated_at for series files without user-set facts.
 FACTLESS_UPDATED_AT = "1970-01-01T00:00:00.000Z"
@@ -170,6 +172,7 @@ def main():
     parser.add_argument(
         "--model", default="kha-white/manga-ocr-base", help="manga-ocr model name or path (default: %(default)s)"
     )
+    parser.add_argument("--version", action="version", version=f"mokuro-cbz {__version__}")
     args = parser.parse_args()
 
     target_dirs = []

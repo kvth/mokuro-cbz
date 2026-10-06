@@ -5,6 +5,11 @@ pages and packs each volume into a CBZ that is laid out exactly like the
 [mokuro reader](https://reader.mokuro.app)'s own CBZ export, so it can be
 imported into the reader directly.
 
+A second command, `mokuro-translate`, adds DeepL translations of every speech
+bubble to CBZs that already contain a `.mokuro` file, whether made by
+`mokuro-cbz`, exported from the reader or from anywhere else (see
+[Translating CBZs](#translating-cbzs)).
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/). Nothing else needs to be installed: the
@@ -117,6 +122,77 @@ volumes at the end and exits with status 1.
   script still works before changing the pin.
 - mokuro's legacy HTML output is not generated.
 
+## Translating CBZs
+
+`mokuro-translate` adds a machine translation of every speech bubble to the
+`.mokuro` files inside existing CBZs, using the
+[DeepL API](https://www.deepl.com/pro-api). It needs no OCR, no source
+images and no GPU, only the CBZs.
+
+```bash
+export DEEPL_AUTH_KEY=your-key
+./mokuro-translate "series - Vol 1.cbz"              # English (the default)
+./mokuro-translate ~/manga --lang en,de              # every CBZ under ~/manga
+./mokuro-translate ~/manga --lang en,de --dry-run    # only count characters
+```
+
+| Option | Description |
+| --- | --- |
+| `-l`, `--lang LANGS` | Comma-separated DeepL target languages (default: `en`) |
+| `-n`, `--dry-run` | Only count the characters that would be sent to DeepL; needs no API key and changes nothing |
+| `--version` | Print the version and exit |
+
+Folders are searched recursively for `.cbz` and `.zip` files. Each CBZ is
+rewritten in place with only its `.mokuro` files changed. Every text block in
+them gets a `translations` object with one entry per language, under the code
+you passed:
+
+```json
+{
+  "box": [120, 340, 260, 610],
+  "vertical": true,
+  "font_size": 28,
+  "lines": ["おはよう", "ございます"],
+  "translations": { "en": "Good morning.", "de": "Guten Morgen." }
+}
+```
+
+- Readers that don't know the key ignore it, so the CBZ still works in the
+  upstream mokuro reader. CBZs made by `mokuro-cbz` itself never contain it.
+- **Only missing translations are requested.** Blocks that already have one
+  for a language are left alone, and a CBZ that needs nothing isn't
+  rewritten, so re-running over a whole library only costs what's new, e.g.
+  newly added volumes or a new language.
+- If DeepL stops partway (e.g. the quota is used up), everything translated
+  so far is written to the CBZ, the run stops, and the next run carries on
+  from there.
+- Each bubble is translated with the rest of its page as context, which
+  DeepL doesn't bill. Repeated text in a volume is sent only once.
+- Languages are DeepL target language codes, case-insensitive: `en`, `de`,
+  `fr`, `en-gb`, `zh-hant`, … Plain `en` is sent as `EN-US` and plain `pt`
+  as `PT-BR`, since DeepL needs a regional variant for those. The key and
+  the languages are checked before anything is translated.
+- At the end it prints the characters sent and your DeepL usage for the
+  billing period.
+
+### Getting a DeepL API key
+
+1. Sign up for **DeepL API Free** at <https://www.deepl.com/pro-api>
+   (pick the API plan, not the DeepL Translator subscription). DeepL asks
+   for a credit card to verify your identity; the free plan doesn't charge
+   it.
+2. Log in and open **Account → API Keys & Limits**
+   (<https://www.deepl.com/your-account/keys>), create a key and copy it.
+   Free keys end in `:fx`.
+3. Pass it in `DEEPL_AUTH_KEY`, e.g. put `export DEEPL_AUTH_KEY=...` in your
+   `~/.bashrc`.
+
+The free plan allows 500,000 characters a month. DeepL bills every character
+once per target language, and a volume is very roughly 20,000–40,000
+characters, so plan for about 12–25 volumes a month per language. Use
+`--dry-run` to see what a library would cost; when the quota runs out, run
+again next month and it continues where it stopped.
+
 ## Packaging
 
 ```
@@ -128,10 +204,10 @@ make rpm                  # -> build/mokuro-cbz-<version>-1.noarch.rpm
 
 - the version is `__version__` in `mokuro-cbz` (override with `VERSION=x.y.z`);
   to release: bump it, commit, `git tag v<version>`
-- packages install `mokuro-cbz` to `/usr/bin/mokuro-cbz` and are
-  architecture independent
+- packages install `mokuro-cbz` and `mokuro-translate` to `/usr/bin` and
+  are architecture independent; both scripts carry the same `__version__`
 - uv is needed at runtime but is not a package dependency, since
   distributions don't package it; install it yourself
-- bash completion: `completions/mokuro-cbz.bash`, installed to
-  `/usr/share/bash-completion/completions/mokuro-cbz`; lists the options by
-  hand, so keep it in sync with the script
+- bash completion: `completions/<command>.bash`, installed to
+  `/usr/share/bash-completion/completions/<command>`; lists the options by
+  hand, so keep it in sync with the scripts

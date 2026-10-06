@@ -1,0 +1,270 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["deepl~=1.32"]
+# ///
+"""Adds DeepL translations of every speech bubble to the .mokuro files inside
+existing CBZs.
+
+Usage:
+  ./mokuro-translate <cbz-or-folder> [<cbz-or-folder> ...] [-l LANGS] [-n]
+
+Every text block of every .mokuro file in a CBZ gets a "translations" object
+mapping each language to DeepL's translation of the block's text, e.g.
+{"en": "Good morning.", "de": "Guten Morgen."}. Other readers ignore the
+extra key. The DeepL API key is read from DEEPL_AUTH_KEY.
+
+Only missing translations are requested: blocks that already have one for a
+language are left alone, and a CBZ that needs nothing isn't rewritten. So a
+re-run over a whole library only pays for what's new, and a run cut short
+(e.g. by the DeepL quota) carries on where it stopped, since whatever was
+translated is written to the CBZ before giving up.
+
+Folders are searched recursively for .cbz and .zip files. A CBZ is rewritten
+in place through a temporary file next to it, with every other entry copied
+unchanged.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+import deepl
+
+__version__ = "0.2.0"
+
+ARCHIVE_SUFFIXES = {".cbz", ".zip"}
+SOURCE_LANG = "JA"
+# DeepL rejects the plain "EN" and "PT" targets; these regional variants are used for them.
+DEFAULT_REGIONAL_TARGETS = {"EN": "EN-US", "PT": "PT-BR"}
+# DeepL accepts at most 50 texts per translate request.
+DEEPL_MAX_TEXTS = 50
+
+
+def natural_key(s):
+    return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", s)]
+
+
+def parse_languages(value):
+    """Parses "en,de" into ["en", "de"]."""
+    langs = list(dict.fromkeys(lang.strip().lower() for lang in value.split(",") if lang.strip()))
+    if not langs:
+        raise argparse.ArgumentTypeError("no language given")
+    return langs
+
+
+def deepl_target(lang):
+    code = lang.upper()
+    return DEFAULT_REGIONAL_TARGETS.get(code, code)
+
+
+def block_text(block):
+    return "".join(block.get("lines", [])).strip()
+
+
+def find_archives(paths):
+    archives = []
+    for path in paths:
+        if path.is_dir():
+            found = [p for p in path.rglob("*") if p.suffix.lower() in ARCHIVE_SUFFIXES and p.is_file()]
+            archives += sorted(found, key=lambda p: natural_key(str(p)))
+        else:
+            archives.append(path)
+    return list(dict.fromkeys(p.resolve() for p in archives))
+
+
+def translate_volume(translator, langs, mokuro_data, stats):
+    """Fills in the missing translations of the volume's blocks.
+
+    Counts the characters sent to DeepL and the translations added in stats
+    as it goes, so the counts stay right when DeepL fails partway; the
+    translations received until then are kept in mokuro_data. With translator
+    None nothing is sent, only counted.
+    """
+    pages = mokuro_data.get("pages", [])
+    for lang in langs:
+        # Bubbles repeat ("はい", sound effects), so each text is sent once per
+        # volume, and translations already in the file are reused.
+        known = {}
+        sent = set()
+        for page in pages:
+            for block in page.get("blocks", []):
+                translation = block.get("translations", {}).get(lang)
+                if translation is not None:
+                    known.setdefault(block_text(block), translation)
+
+        for page in pages:
+            blocks = [block for block in page.get("blocks", []) if block_text(block)]
+            todo = [block for block in blocks if lang not in block.get("translations", {})]
+            if not todo:
+                continue
+            done = known.keys() | sent
+            missing = list(dict.fromkeys(text for text in map(block_text, todo) if text not in done))
+            # The page's whole text goes along as context (which DeepL doesn't
+            # bill), since a speech bubble on its own is often ambiguous.
+            context = "\n".join(block_text(block) for block in blocks)
+            try:
+                for i in range(0, len(missing), DEEPL_MAX_TEXTS):
+                    batch = missing[i : i + DEEPL_MAX_TEXTS]
+                    if translator:
+                        results = translator.translate_text(
+                            batch, source_lang=SOURCE_LANG, target_lang=deepl_target(lang), context=context
+                        )
+                        for text, result in zip(batch, results):
+                            known[text] = result.text
+                    sent.update(batch)
+                    stats["sent_chars"] += sum(len(text) for text in batch)
+            finally:
+                for block in todo:
+                    if block_text(block) in known:
+                        block.setdefault("translations", {})[lang] = known[block_text(block)]
+                        stats["added"] += 1
+
+
+def rewrite_archive(path, mokuro_files):
+    """Rewrites the archive with the given .mokuro entries replaced."""
+    tmp_path = path.with_name(path.name + ".part")
+    try:
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(tmp_path, "w") as dst:
+            dst.comment = src.comment
+            for info in src.infolist():
+                if info.filename in mokuro_files:
+                    data = json.dumps(mokuro_files[info.filename], ensure_ascii=False, separators=(",", ":"))
+                    data = data.encode("utf-8")
+                else:
+                    data = src.read(info)
+                # A fresh ZipInfo keeps the name, date, compression and
+                # permissions but none of the old sizes or extra fields.
+                new_info = zipfile.ZipInfo(info.filename, info.date_time)
+                new_info.compress_type = info.compress_type
+                new_info.external_attr = info.external_attr
+                new_info.create_system = info.create_system
+                new_info.comment = info.comment
+                dst.writestr(new_info, data)
+        shutil.copymode(path, tmp_path)
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def translate_archive(path, translator, langs):
+    """Translates every .mokuro in the archive. Returns the characters sent.
+
+    If DeepL fails partway, the archive is still rewritten with what was
+    translated before the error is raised.
+    """
+    with zipfile.ZipFile(path) as zf:
+        names = [
+            info.filename
+            for info in zf.infolist()
+            if info.filename.lower().endswith(".mokuro") and not info.filename.startswith("__MACOSX/")
+        ]
+        volumes = {name: json.loads(zf.read(name).decode("utf-8-sig")) for name in names}
+    if not volumes:
+        print(f"{path.name}: no .mokuro file, skipped")
+        return 0
+
+    stats = {"sent_chars": 0, "added": 0}
+    try:
+        for data in volumes.values():
+            translate_volume(translator, langs, data, stats)
+    finally:
+        if translator and stats["added"]:
+            rewrite_archive(path, volumes)
+    sent_chars, added = stats["sent_chars"], stats["added"]
+
+    if translator:
+        if added:
+            print(f"{path.name}: added {added} translations, {sent_chars} characters sent to DeepL")
+        else:
+            print(f"{path.name}: already translated")
+    else:
+        print(f"{path.name}: {sent_chars} characters to translate")
+    return sent_chars
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Add DeepL translations of every speech bubble to the .mokuro files inside existing CBZs."
+    )
+    parser.add_argument(
+        "paths", nargs="+", type=Path, metavar="cbz-or-folder", help="CBZ/ZIP files, or folders to search for them"
+    )
+    parser.add_argument(
+        "-l",
+        "--lang",
+        type=parse_languages,
+        default=["en"],
+        metavar="LANGS",
+        help="comma-separated DeepL target languages, e.g. en,de (default: en)",
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only count the characters that would be sent to DeepL; needs no API key and changes nothing",
+    )
+    parser.add_argument("--version", action="version", version=f"mokuro-translate {__version__}")
+    args = parser.parse_args()
+
+    for path in args.paths:
+        if not path.exists():
+            parser.error(f"No such file or folder: {path}")
+    archives = find_archives(args.paths)
+    if not archives:
+        parser.error("No .cbz or .zip files found")
+
+    translator = None
+    if not args.dry_run:
+        auth_key = os.environ.get("DEEPL_AUTH_KEY")
+        if not auth_key:
+            parser.error("Set your DeepL API key in the DEEPL_AUTH_KEY environment variable")
+        translator = deepl.DeepLClient(auth_key)
+        try:
+            supported = {lang.code.upper() for lang in translator.get_target_languages()}
+        except deepl.DeepLException as e:
+            parser.error(f"DeepL: {e}")
+        unsupported = [lang for lang in args.lang if deepl_target(lang) not in supported]
+        if unsupported:
+            parser.error(f"DeepL can't translate to: {', '.join(unsupported)}")
+
+    total_chars = 0
+    failed = []
+    for i, path in enumerate(archives):
+        try:
+            total_chars += translate_archive(path, translator, args.lang)
+        except deepl.QuotaExceededException:
+            print(f"{path.name}: DeepL quota exceeded, stopping", file=sys.stderr)
+            failed += archives[i:]
+            break
+        except Exception as e:
+            print(f"{path.name}: failed: {e!r}", file=sys.stderr)
+            failed.append(path)
+
+    if args.dry_run:
+        print(f"\n{total_chars} characters would be sent to DeepL")
+    else:
+        print(f"\n{total_chars} characters sent to DeepL")
+        try:
+            usage = translator.get_usage().character
+            if usage.valid:
+                print(f"DeepL usage this billing period: {usage.count} of {usage.limit} characters")
+        except deepl.DeepLException:
+            pass
+
+    if failed:
+        print(f"\n{len(failed)} of {len(archives)} not (fully) translated:", file=sys.stderr)
+        for path in failed:
+            print(f"  {path}", file=sys.stderr)
+        print("Run again to translate the rest; finished translations are kept.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

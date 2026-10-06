@@ -1,5 +1,5 @@
 name: mokuro-cbz
-# A single Python script run through uv, so the package is architecture
+# Python scripts run through uv, so the package is architecture
 # independent
 arch: all
 platform: linux
@@ -10,7 +10,8 @@ maintainer: Kevin Thomas <thomas.kevth@gmail.com>
 description: |
   Run mokuro OCR on manga folders and pack each volume into a CBZ.
   The CBZs are laid out like the mokuro reader's own export, so they can
-  be imported into the reader directly.
+  be imported into the reader directly. mokuro-translate adds DeepL
+  translations of the speech bubbles to existing CBZs.
 license: MIT
 # Needs uv at runtime (the script runs through 'uv run --script'), which is
 # not packaged by the distributions, so it is not declared as a dependency
@@ -21,5 +22,13 @@ contents:
       mode: 0755
   - src: ./completions/mokuro-cbz.bash
     dst: /usr/share/bash-completion/completions/mokuro-cbz
+    file_info:
+      mode: 0644
+  - src: ./mokuro-translate
+    dst: /usr/bin/mokuro-translate
+    file_info:
+      mode: 0755
+  - src: ./completions/mokuro-translate.bash
+    dst: /usr/share/bash-completion/completions/mokuro-translate
     file_info:
       mode: 0644

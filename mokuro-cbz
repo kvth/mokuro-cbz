@@ -43,7 +43,7 @@ import mokuro.volume
 from mokuro import MokuroGenerator
 from mokuro.volume import VolumeCollection
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 SERIES_FILE_NAME = "series.json"
 # The reader uses the epoch as updated_at for series files without user-set facts.

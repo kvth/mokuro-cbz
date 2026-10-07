@@ -7,12 +7,17 @@
 existing CBZs.
 
 Usage:
-  ./mokuro-translate <cbz-or-folder> [<cbz-or-folder> ...] [-l LANGS] [-n]
+  ./mokuro-translate <cbz-or-folder> [<cbz-or-folder> ...] [-l LANGS]
+                    [-i INSTRUCTION ...] [-s SUFFIX] [-n]
 
 Every text block of every .mokuro file in a CBZ gets a "translations" object
 mapping each language to DeepL's translation of the block's text, e.g.
 {"en": "Good morning.", "de": "Guten Morgen."}. Other readers ignore the
 extra key. The DeepL API key is read from DEEPL_AUTH_KEY.
+
+Custom instructions (-i, e.g. "Translate as literally as possible") steer
+DeepL's translation. With a suffix (-s literal) the translations are stored
+under "en-literal" instead of "en", next to the plain ones.
 
 Only missing translations are requested: blocks that already have one for a
 language are left alone, and a CBZ that needs nothing isn't rewritten. So a
@@ -36,7 +41,7 @@ from pathlib import Path
 
 import deepl
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 ARCHIVE_SUFFIXES = {".cbz", ".zip"}
 SOURCE_LANG = "JA"
@@ -44,6 +49,12 @@ SOURCE_LANG = "JA"
 DEFAULT_REGIONAL_TARGETS = {"EN": "EN-US", "PT": "PT-BR"}
 # DeepL accepts at most 50 texts per translate request.
 DEEPL_MAX_TEXTS = 50
+# DeepL accepts at most 10 custom instructions of 300 characters each.
+DEEPL_MAX_INSTRUCTIONS = 10
+DEEPL_MAX_INSTRUCTION_CHARS = 300
+# The client's default 10 s read timeout is too short for a full batch with
+# custom instructions, which DeepL translates noticeably slower.
+DEFAULT_TIMEOUT = 60.0
 
 
 def natural_key(s):
@@ -56,6 +67,33 @@ def parse_languages(value):
     if not langs:
         raise argparse.ArgumentTypeError("no language given")
     return langs
+
+
+def parse_instruction(value):
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("empty instruction")
+    if len(value) > DEEPL_MAX_INSTRUCTION_CHARS:
+        raise argparse.ArgumentTypeError(f"longer than {DEEPL_MAX_INSTRUCTION_CHARS} characters")
+    return value
+
+
+def parse_suffix(value):
+    """Checks the suffix fits in a language key like "en-literal"."""
+    value = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]+(-[a-z0-9_]+)*", value):
+        raise argparse.ArgumentTypeError("use only letters, digits, '_' and '-'")
+    return value
+
+
+def parse_timeout(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value}") from None
+    if not seconds > 0:
+        raise argparse.ArgumentTypeError("must be more than 0")
+    return seconds
 
 
 def deepl_target(lang):
@@ -78,8 +116,11 @@ def find_archives(paths):
     return list(dict.fromkeys(p.resolve() for p in archives))
 
 
-def translate_volume(translator, langs, mokuro_data, stats):
+def translate_volume(translator, langs, mokuro_data, stats, instructions=None, suffix=None):
     """Fills in the missing translations of the volume's blocks.
+
+    Translations are stored under the language code, or "<lang>-<suffix>"
+    with a suffix, and made with the given DeepL custom instructions.
 
     Counts the characters sent to DeepL and the translations added in stats
     as it goes, so the counts stay right when DeepL fails partway; the
@@ -88,19 +129,20 @@ def translate_volume(translator, langs, mokuro_data, stats):
     """
     pages = mokuro_data.get("pages", [])
     for lang in langs:
+        key = f"{lang}-{suffix}" if suffix else lang
         # Bubbles repeat ("はい", sound effects), so each text is sent once per
         # volume, and translations already in the file are reused.
         known = {}
         sent = set()
         for page in pages:
             for block in page.get("blocks", []):
-                translation = block.get("translations", {}).get(lang)
+                translation = block.get("translations", {}).get(key)
                 if translation is not None:
                     known.setdefault(block_text(block), translation)
 
         for page in pages:
             blocks = [block for block in page.get("blocks", []) if block_text(block)]
-            todo = [block for block in blocks if lang not in block.get("translations", {})]
+            todo = [block for block in blocks if key not in block.get("translations", {})]
             if not todo:
                 continue
             done = known.keys() | sent
@@ -113,7 +155,11 @@ def translate_volume(translator, langs, mokuro_data, stats):
                     batch = missing[i : i + DEEPL_MAX_TEXTS]
                     if translator:
                         results = translator.translate_text(
-                            batch, source_lang=SOURCE_LANG, target_lang=deepl_target(lang), context=context
+                            batch,
+                            source_lang=SOURCE_LANG,
+                            target_lang=deepl_target(lang),
+                            context=context,
+                            custom_instructions=instructions or None,
                         )
                         for text, result in zip(batch, results):
                             known[text] = result.text
@@ -122,7 +168,7 @@ def translate_volume(translator, langs, mokuro_data, stats):
             finally:
                 for block in todo:
                     if block_text(block) in known:
-                        block.setdefault("translations", {})[lang] = known[block_text(block)]
+                        block.setdefault("translations", {})[key] = known[block_text(block)]
                         stats["added"] += 1
 
 
@@ -153,11 +199,12 @@ def rewrite_archive(path, mokuro_files):
         raise
 
 
-def translate_archive(path, translator, langs):
-    """Translates every .mokuro in the archive. Returns the characters sent.
+def translate_archive(path, translator, langs, totals, instructions=None, suffix=None):
+    """Translates every .mokuro in the archive.
 
-    If DeepL fails partway, the archive is still rewritten with what was
-    translated before the error is raised.
+    The characters sent are added to totals["sent_chars"]. If DeepL fails
+    partway, they're still counted and the archive is still rewritten with
+    what was translated before the error is raised.
     """
     with zipfile.ZipFile(path) as zf:
         names = [
@@ -168,13 +215,21 @@ def translate_archive(path, translator, langs):
         volumes = {name: json.loads(zf.read(name).decode("utf-8-sig")) for name in names}
     if not volumes:
         print(f"{path.name}: no .mokuro file, skipped")
-        return 0
+        return
 
     stats = {"sent_chars": 0, "added": 0}
     try:
         for data in volumes.values():
-            translate_volume(translator, langs, data, stats)
+            translate_volume(translator, langs, data, stats, instructions, suffix)
+    except BaseException:
+        if translator and stats["added"]:
+            print(
+                f"{path.name}: added {stats['added']} translations before stopping, "
+                f"{stats['sent_chars']} characters sent to DeepL"
+            )
+        raise
     finally:
+        totals["sent_chars"] += stats["sent_chars"]
         if translator and stats["added"]:
             rewrite_archive(path, volumes)
     sent_chars, added = stats["sent_chars"], stats["added"]
@@ -186,7 +241,6 @@ def translate_archive(path, translator, langs):
             print(f"{path.name}: already translated")
     else:
         print(f"{path.name}: {sent_chars} characters to translate")
-    return sent_chars
 
 
 def main():
@@ -205,6 +259,33 @@ def main():
         help="comma-separated DeepL target languages, e.g. en,de (default: en)",
     )
     parser.add_argument(
+        "-i",
+        "--instruction",
+        dest="instructions",
+        action="append",
+        type=parse_instruction,
+        default=[],
+        metavar="INSTRUCTION",
+        help=f"a DeepL custom instruction, e.g. 'Translate as literally as possible'; repeatable, "
+        f"up to {DEEPL_MAX_INSTRUCTIONS} of at most {DEEPL_MAX_INSTRUCTION_CHARS} characters",
+    )
+    parser.add_argument(
+        "-s",
+        "--suffix",
+        type=parse_suffix,
+        metavar="SUFFIX",
+        help="store the translations under LANG-SUFFIX (e.g. en-literal) instead of LANG, "
+        "to keep them apart from translations made without the instructions",
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=parse_timeout,
+        default=DEFAULT_TIMEOUT,
+        metavar="SECONDS",
+        help=f"how long to wait for each DeepL request before retrying (default: {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
@@ -213,6 +294,8 @@ def main():
     parser.add_argument("--version", action="version", version=f"mokuro-translate {__version__}")
     args = parser.parse_args()
 
+    if len(args.instructions) > DEEPL_MAX_INSTRUCTIONS:
+        parser.error(f"DeepL accepts at most {DEEPL_MAX_INSTRUCTIONS} instructions")
     for path in args.paths:
         if not path.exists():
             parser.error(f"No such file or folder: {path}")
@@ -225,6 +308,7 @@ def main():
         auth_key = os.environ.get("DEEPL_AUTH_KEY")
         if not auth_key:
             parser.error("Set your DeepL API key in the DEEPL_AUTH_KEY environment variable")
+        deepl.http_client.min_connection_timeout = args.timeout
         translator = deepl.DeepLClient(auth_key)
         try:
             supported = {lang.code.upper() for lang in translator.get_target_languages()}
@@ -234,11 +318,11 @@ def main():
         if unsupported:
             parser.error(f"DeepL can't translate to: {', '.join(unsupported)}")
 
-    total_chars = 0
+    totals = {"sent_chars": 0}
     failed = []
     for i, path in enumerate(archives):
         try:
-            total_chars += translate_archive(path, translator, args.lang)
+            translate_archive(path, translator, args.lang, totals, args.instructions, args.suffix)
         except deepl.QuotaExceededException:
             print(f"{path.name}: DeepL quota exceeded, stopping", file=sys.stderr)
             failed += archives[i:]
@@ -248,9 +332,9 @@ def main():
             failed.append(path)
 
     if args.dry_run:
-        print(f"\n{total_chars} characters would be sent to DeepL")
+        print(f"\n{totals['sent_chars']} characters would be sent to DeepL")
     else:
-        print(f"\n{total_chars} characters sent to DeepL")
+        print(f"\n{totals['sent_chars']} characters sent to DeepL")
         try:
             usage = translator.get_usage().character
             if usage.valid:

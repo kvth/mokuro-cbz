@@ -13,6 +13,10 @@ _mokuro_translate() {
             COMPREPLY=($(compgen -W "en de en-gb en-us fr es it ja ko nl pl pt-br pt-pt ru uk zh-hans zh-hant" -- "$cur"))
             return
             ;;
+        -i | --instruction | -s | --suffix | -t | --timeout)
+            # free text or a number
+            return
+            ;;
         -h | --help | --version)
             return
             ;;
@@ -20,7 +24,7 @@ _mokuro_translate() {
     $split && return
 
     if [[ $cur == -* ]]; then
-        COMPREPLY=($(compgen -W "-l --lang -n --dry-run --version -h --help" -- "$cur"))
+        COMPREPLY=($(compgen -W "-l --lang -i --instruction -s --suffix -t --timeout -n --dry-run --version -h --help" -- "$cur"))
         return
     fi
 

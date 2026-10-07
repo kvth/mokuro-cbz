@@ -134,11 +134,15 @@ export DEEPL_AUTH_KEY=your-key
 ./mokuro-translate "series - Vol 1.cbz"              # English (the default)
 ./mokuro-translate ~/manga --lang en,de              # every CBZ under ~/manga
 ./mokuro-translate ~/manga --lang en,de --dry-run    # only count characters
+./mokuro-translate ~/manga -i "Translate as literally as possible" -s literal
 ```
 
 | Option | Description |
 | --- | --- |
 | `-l`, `--lang LANGS` | Comma-separated DeepL target languages (default: `en`) |
+| `-i`, `--instruction INSTRUCTION` | A DeepL [custom instruction](https://developers.deepl.com/docs/customize/custom-instructions); repeatable, up to 10 of at most 300 characters |
+| `-s`, `--suffix SUFFIX` | Store the translations under `LANG-SUFFIX` (e.g. `en-literal`) instead of `LANG` |
+| `-t`, `--timeout SECONDS` | How long to wait for each DeepL request before retrying (default: `60`) |
 | `-n`, `--dry-run` | Only count the characters that would be sent to DeepL; needs no API key and changes nothing |
 | `--version` | Print the version and exit |
 
@@ -163,6 +167,10 @@ you passed:
   for a language are left alone, and a CBZ that needs nothing isn't
   rewritten, so re-running over a whole library only costs what's new, e.g.
   newly added volumes or a new language.
+- **Runs add up.** Each run only adds its own keys and keeps every other
+  translation in the file, so languages can be added one run at a time:
+  `--lang en` and later `--lang de` leave both `en` and `de`. Existing
+  translations are never overwritten.
 - If DeepL stops partway (e.g. the quota is used up), everything translated
   so far is written to the CBZ, the run stops, and the next run carries on
   from there.
@@ -174,6 +182,43 @@ you passed:
   the languages are checked before anything is translated.
 - At the end it prints the characters sent and your DeepL usage for the
   billing period.
+
+### Custom instructions
+
+`--instruction` passes natural-language rules that steer how DeepL
+translates, e.g. `"Translate as literally as possible, keeping the Japanese
+sentence structure"` to get translations that map more closely onto the
+Japanese. DeepL applies them to each bubble separately, so they work best as
+sentence-level rules about wording and style; they don't make DeepL explain
+anything, only translate differently.
+
+Since blocks that already have a translation are skipped, use `--suffix` to
+store translations made with instructions under their own key, next to the
+plain ones:
+
+```json
+"translations": { "en": "…", "en-literal": "…" }
+```
+
+A run with `--suffix` only fills in its own key, here `en-literal`; it
+doesn't create plain `en`. To get both, run once without and once with the
+instructions, in either order:
+
+```bash
+./mokuro-translate ~/manga                                                     # en
+./mokuro-translate ~/manga -i "Translate as literally as possible" -s literal  # en-literal
+```
+
+Each suffix is translated and billed separately, so it costs the same
+characters again as the plain translation (`--dry-run -s literal` shows how
+many). Requests with instructions use DeepL's slower `quality_optimized`
+model, so expect the run to take longer. If requests time out, raise
+`--timeout`.
+
+Use the same instructions every time you run with a given suffix: blocks
+that already have a translation under that key aren't redone, so changing the
+instructions only affects new ones. To try different instructions, use a new
+suffix.
 
 ### Getting a DeepL API key
 
